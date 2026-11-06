@@ -1,0 +1,416 @@
+"""Paper-only stock options alert and evaluation script.
+
+This file is intentionally restricted to paper trading. It watches a curated list
+of option-capable Indian stocks, scans for intraday BUY/PUT signals, selects the
+nearest CE/PE option contract, and logs the trade result to CSV without placing
+any real Kite order.
+"""
+from __future__ import annotations
+
+import csv
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from kiteconnect import KiteConnect
+
+IST = ZoneInfo("Asia/Kolkata")
+ROOT = Path(__file__).resolve().parent
+
+WATCHLIST = [
+    "RELIANCE",
+    "TCS",
+    "INFY",
+    "HDFCBANK",
+    "ICICIBANK",
+    "SBIN",
+    "AXISBANK",
+    "KOTAKBANK",
+    "ITC",
+    "WIPRO",
+    "BHARTIARTL",
+    "COFORGE",
+    "JSWENERGY",
+    "LTIM",
+    "TATAMOTORS",
+    "TATASTEEL",
+    "HCLTECH",
+    "TECHM",
+    "INDUSINDBK",
+    "BAJFINANCE",
+    "MARUTI",
+    "TITAN",
+    "ASIANPAINT",
+    "ULTRACEMCO",
+    "NTPC",
+    "POWERGRID",
+    "IOC",
+    "GAIL",
+    "BRITANNIA",
+    "CIPLA",
+    "DRREDDY",
+    "EICHERMOT",
+    "HEROMOTOCO",
+    "M&M",
+    "BEL",
+    "TRENT",
+    "HDFCLIFE",
+    "METROPOLIS",
+    "APOLLOHOSP",
+    "NESTLEIND",
+    "SHREECEM",
+    "DIVISLAB",
+    "BPCL",
+    "GRASIM",
+    "HINDALCO",
+    "ONGC",
+    "BAJAJ-AUTO",
+    "UPL",
+    "CHOLAFIN",
+    "ADANIPORTS",
+    "INDIGO",
+    "ABB",
+    "BHEL",
+    "DMART",
+    "TATACONSUM",
+    "TORNTPHARM",
+    "PAGEIND",
+    "BANKBARODA",
+    "PFC",
+    "RBLBANK",
+    "AUBANK",
+    "ZEEL",
+    "HDFCAMC",
+]
+
+
+@dataclass
+class PaperTrade:
+    label: str
+    signal: str
+    entry_price: float
+    stop_price: float
+    target_price: float
+    entry_time: datetime
+    exit_price: float | None = None
+    exit_time: datetime | None = None
+    pnl: float | None = None
+    result: str | None = None
+    exit_reason: str | None = None
+
+
+class PaperTradeEvaluator:
+    def __init__(self) -> None:
+        self.open_trades: dict[str, PaperTrade] = {}
+        self.completed: list[PaperTrade] = []
+        self.total_trades = 0
+        self.winning_trades = 0
+        self.losing_trades = 0
+        self.net_pnl = 0.0
+        self.csv_path = ROOT / "paper_trades.csv"
+        self._ensure_csv_header()
+
+    def _ensure_csv_header(self) -> None:
+        file_exists = self.csv_path.exists()
+        with self.csv_path.open("a", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            if not file_exists:
+                writer.writerow([
+                    "label",
+                    "signal",
+                    "entry_price",
+                    "exit_price",
+                    "pnl",
+                    "result",
+                    "exit_reason",
+                    "entry_time",
+                    "exit_time",
+                ])
+
+    def open_trade(self, label: str, signal: str, price: float, now: datetime) -> None:
+        if label in self.open_trades:
+            return
+        stop = price * 0.995 if signal == "BUY" else price * 1.005
+        target = price * 1.02 if signal == "BUY" else price * 0.98
+        self.open_trades[label] = PaperTrade(
+            label=label,
+            signal=signal,
+            entry_price=price,
+            stop_price=stop,
+            target_price=target,
+            entry_time=now,
+        )
+        print(f"[PAPER OPEN] {label} {signal} @ {price:.2f} | stop={stop:.2f} | target={target:.2f}")
+
+    def _finalize_trade(self, label: str, current_price: float, now: datetime, exit_reason: str) -> None:
+        trade = self.open_trades.get(label)
+        if trade is None:
+            return
+
+        pnl = (current_price - trade.entry_price) if trade.signal == "BUY" else (trade.entry_price - current_price)
+        trade.exit_price = current_price
+        trade.exit_time = now
+        trade.pnl = pnl
+        trade.exit_reason = exit_reason
+        trade.result = "WIN" if pnl > 0 else "LOSS"
+
+        self.total_trades += 1
+        if pnl > 0:
+            self.winning_trades += 1
+        else:
+            self.losing_trades += 1
+        self.net_pnl += pnl
+        self.completed.append(trade)
+
+        with self.csv_path.open("a", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow([
+                trade.label,
+                trade.signal,
+                f"{trade.entry_price:.2f}",
+                f"{trade.exit_price:.2f}",
+                f"{trade.pnl:.2f}",
+                trade.result,
+                trade.exit_reason,
+                trade.entry_time.strftime("%Y-%m-%d %H:%M:%S"),
+                trade.exit_time.strftime("%Y-%m-%d %H:%M:%S") if trade.exit_time else "",
+            ])
+
+        del self.open_trades[label]
+        print(
+            f"[PAPER CLOSE] {label} {trade.signal} entry={trade.entry_price:.2f} "
+            f"exit={current_price:.2f} pnl={pnl:.2f} result={trade.result} reason={exit_reason}"
+        )
+
+    def close_on_opposite_signal(self, label: str, signal: str, current_price: float, now: datetime) -> None:
+        trade = self.open_trades.get(label)
+        if trade is None:
+            return
+        if trade.signal == signal:
+            return
+        self._finalize_trade(label, current_price, now, "OPPOSITE_SIGNAL")
+
+    def print_summary(self) -> None:
+        win_rate = (self.winning_trades / self.total_trades * 100.0) if self.total_trades else 0.0
+        print(
+            "[PAPER SUMMARY] total="
+            f"{self.total_trades} wins={self.winning_trades} losses={self.losing_trades} "
+            f"win_rate={win_rate:.2f}% net_pnl={self.net_pnl:.2f}"
+        )
+
+
+def load_credentials() -> tuple[str, str]:
+    values: dict[str, str] = {}
+    for line in (ROOT / "credentials.txt").read_text(encoding="utf-8").splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    api_key = os.getenv("KITE_API_KEY", values.get("api_key", ""))
+    api_secret = os.getenv("KITE_API_SECRET", values.get("api_secret", ""))
+    if not api_key or not api_secret:
+        raise RuntimeError("Set KITE_API_KEY and KITE_API_SECRET or fill credentials.txt")
+    return api_key, api_secret
+
+
+def optionable_stocks(kite: KiteConnect) -> list[str]:
+    option_names = set()
+    for row in kite.instruments("NFO"):
+        name = str(row.get("name", "")).strip().upper()
+        instrument_type = str(row.get("instrument_type", "")).strip().upper()
+        if instrument_type in {"CE", "PE"} and name:
+            option_names.add(name)
+    filtered = [stock for stock in WATCHLIST if stock.upper() in option_names]
+    return filtered
+
+
+def ema(values: list[float], period: int) -> float:
+    if not values:
+        return 0.0
+    alpha = 2.0 / (period + 1)
+    out = values[0]
+    for value in values[1:]:
+        out = (alpha * value) + ((1 - alpha) * out)
+    return out
+
+
+def rsi(values: list[float], period: int = 14) -> float:
+    if len(values) < period + 1:
+        return 50.0
+    changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+    recent = changes[-period:]
+    gains = [max(v, 0.0) for v in recent]
+    losses = [max(-v, 0.0) for v in recent]
+    avg_gain = sum(gains) / len(gains) if gains else 0.0
+    avg_loss = sum(losses) / len(losses) if losses else 0.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def detect_signal(candles: list[dict]) -> tuple[str | None, float, float, float, float]:
+    """Return a signal only when momentum and trend are aligned and price breaks the recent range.
+
+    This is intentionally conservative to reduce false positives in choppy intraday data.
+    """
+    if len(candles) < 30:
+        return None, 0.0, 0.0, 0.0, 0.0
+
+    closes = [float(c.get("close", 0.0)) for c in candles if c.get("close") is not None]
+    highs = [float(c.get("high", 0.0)) for c in candles if c.get("high") is not None]
+    lows = [float(c.get("low", 0.0)) for c in candles if c.get("low") is not None]
+    if len(closes) < 30 or len(highs) < 30 or len(lows) < 30:
+        return None, 0.0, 0.0, 0.0, 0.0
+
+    last = closes[-1]
+    recent_10 = closes[-10:]
+    recent_20 = closes[-20:]
+    sma_10 = sum(recent_10) / len(recent_10)
+    sma_20 = sum(recent_20) / len(recent_20)
+    swing_high = max(closes[-20:-1])
+    swing_low = min(closes[-20:-1])
+    recent_range_low = min(lows[-10:])
+    recent_range_high = max(highs[-10:])
+
+    fast_ema = ema(closes, 9)
+    slow_ema = ema(closes, 21)
+    macd = fast_ema - slow_ema
+    rsi_value = rsi(closes, 14)
+
+    last3 = closes[-3:]
+    bullish_sequence = all(last3[i] >= last3[i - 1] for i in range(1, len(last3)))
+    bearish_sequence = all(last3[i] <= last3[i - 1] for i in range(1, len(last3)))
+
+    buy_strength = last > sma_10 and last > sma_20 and last > swing_high and last > recent_range_high
+    sell_strength = last < sma_10 and last < sma_20 and last < swing_low and last < recent_range_low
+    trend_ok = fast_ema > slow_ema and macd > 0.0
+    trend_down_ok = fast_ema < slow_ema and macd < 0.0
+    rsi_buy_ok = rsi_value > 60.0
+    rsi_sell_ok = rsi_value < 40.0
+    breakout_ok = last > max(recent_10[:-1]) and bullish_sequence
+    breakdown_ok = last < min(recent_10[:-1]) and bearish_sequence
+
+    buy_signal = (
+        buy_strength
+        and trend_ok
+        and rsi_buy_ok
+        and breakout_ok
+        and abs(last - sma_20) / sma_20 > 0.003
+    )
+    sell_signal = (
+        sell_strength
+        and trend_down_ok
+        and rsi_sell_ok
+        and breakdown_ok
+        and abs(sma_20 - last) / sma_20 > 0.003
+    )
+
+    if buy_signal:
+        return "BUY", last, sma_20, recent_range_low, recent_range_high
+    if sell_signal:
+        return "PUT", last, sma_20, recent_range_low, recent_range_high
+    return None, last, sma_20, recent_range_low, recent_range_high
+
+
+def nearest_option_contract(kite: KiteConnect, stock_name: str, signal: str, current_price: float) -> dict | None:
+    option_type = "CE" if signal == "BUY" else "PE"
+    today = datetime.now(IST).date()
+    candidates: list[dict] = []
+
+    for row in kite.instruments("NFO"):
+        name = str(row.get("name", "")).strip().upper()
+        if name != stock_name.upper():
+            continue
+        if str(row.get("instrument_type", "")).strip().upper() != option_type:
+            continue
+        expiry = row.get("expiry")
+        if not expiry or expiry < today:
+            continue
+        strike = float(row.get("strike", 0.0) or 0.0)
+        candidates.append({"row": row, "diff": abs(strike - current_price)})
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item["diff"], item["row"].get("expiry", today)))
+    return candidates[0]["row"]
+
+
+def monitor() -> None:
+    api_key, _ = load_credentials()
+    access_token = os.getenv("KITE_ACCESS_TOKEN", "").strip()
+    if not access_token:
+        raise RuntimeError("Set KITE_ACCESS_TOKEN to today's Kite access token")
+
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    try:
+        kite.profile()
+        print("Kite credentials check: OK")
+    except Exception as exc:
+        raise RuntimeError(f"Kite credentials check failed: {exc}") from exc
+
+    stocks = optionable_stocks(kite)
+    if not stocks:
+        raise RuntimeError("No option-capable stocks found in the configured watch list")
+
+    print(f"Monitoring {len(stocks)} option-capable stocks in paper mode")
+    print("Paper mode: no real order will be placed.")
+    last_signal: dict[str, str | None] = {label: None for label in stocks}
+    evaluator = PaperTradeEvaluator()
+
+    while True:
+        now = datetime.now(IST)
+        start = now - timedelta(days=1)
+        print(f"\n[{now:%Y-%m-%d %H:%M:%S}] INTRADAY STOCK OPTIONS CHECK START")
+
+        for label in stocks:
+            try:
+                instruments = kite.instruments("NSE")
+                stock_row = next((row for row in instruments if str(row.get("name", "")).strip().upper() == label.upper()), None)
+                if stock_row is None:
+                    print(f"[{now:%H:%M:%S}] {label}: stock row not found")
+                    continue
+
+                token = int(stock_row["instrument_token"])
+                candles = kite.historical_data(token, start, now, "5minute")
+            except Exception as exc:
+                print(f"[{now:%H:%M:%S}] {label}: data error -> {exc}")
+                continue
+
+            signal, current, sma, low, high = detect_signal(candles)
+            if not signal:
+                last_signal[label] = None
+                continue
+
+            if last_signal.get(label) == signal:
+                continue
+
+            if label in evaluator.open_trades and signal != evaluator.open_trades[label].signal:
+                evaluator.close_on_opposite_signal(label, signal, current, now)
+
+            option_row = nearest_option_contract(kite, label, signal, current)
+            if option_row is None:
+                print(f"[{now:%Y-%m-%d %H:%M:%S}] {label}: no matching {signal} option contract found")
+                last_signal[label] = signal
+                continue
+
+            print(
+                f"[{now:%Y-%m-%d %H:%M:%S}] ALERT {label}: {signal} triggered | "
+                f"price={current:.2f}, SMA={sma:.2f}, range={low:.2f}-{high:.2f} | "
+                f"option={option_row.get('tradingsymbol')}"
+            )
+
+            evaluator.open_trade(label, signal, current, now)
+            last_signal[label] = signal
+
+        evaluator.print_summary()
+        print(f"[{now:%Y-%m-%d %H:%M:%S}] INTRADAY STOCK OPTIONS CHECK END\n")
+        time.sleep(60)
+
+
+if __name__ == "__main__":
+    monitor()
